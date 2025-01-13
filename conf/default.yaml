@@ -20,9 +20,9 @@ hydra:
       WANDB_DIR: ${oc.env:WABDB_DIR}
 
 defaults:
-  - data: default
+  - data: perov
   - logging: default
-  - model: diffusion
+  - model: vae
   - optim: default
   - train: default
 #    Decomment this parameter to get parallel job running

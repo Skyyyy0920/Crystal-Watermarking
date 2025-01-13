@@ -1,10 +1,10 @@
 # log frequency
 val_check_interval: 5
-progress_bar_refresh_rate: 1
+progress_bar_refresh_rate: 20
 
 wandb:
   name: ${expname}
-  project: diffcsp
+  project: crystal_generation_mit
   entity: null
   log_model: True
   mode: 'online'
