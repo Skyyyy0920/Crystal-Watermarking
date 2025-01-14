@@ -3,7 +3,6 @@ deterministic: False
 random_seed: 42
 
 # training
-
 pl_trainer:
   fast_dev_run: False # Enable this for debug purposes
   gpus: 1

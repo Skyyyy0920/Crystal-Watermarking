@@ -25,5 +25,12 @@ defaults:
   - model: vae
   - optim: default
   - train: default
-#    Decomment this parameter to get parallel job running
-  # - override hydra/launcher: joblib
+
+watermark:
+  w_pattern: 'rand'
+  w_channel: 0
+  w_mask_shape: 'circle'
+  w_radius: 10
+  w_measurement: 'l1_complex'
+  w_injection: 'complex'
+  w_pattern_const: 0
