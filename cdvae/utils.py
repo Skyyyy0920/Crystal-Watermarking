@@ -1,6 +1,7 @@
 import copy
 import hydra
 import torch
+import torch.fft as fft
 import random
 import numpy as np
 from pathlib import Path
@@ -58,115 +59,108 @@ def set_random_seed(seed=0):
     random.seed(seed + 5)
 
 
-def circle_mask(size=64, r=10, x_offset=0, y_offset=0):
-    x0 = y0 = size // 2
-    x0 += x_offset
-    y0 += y_offset
-    y, x = np.ogrid[:size, :size]
-    y = y[::-1]
+def get_watermarking_pattern(signal_length=256, num_patterns=5, seed=42):
+    """
+    生成水印模式，选择特定的低频分量位置
 
-    return ((x - x0) ** 2 + (y - y0) ** 2) <= r ** 2
+    Args:
+        signal_length: 信号长度
+        num_patterns: 要选择的模式数量
+        seed: 随机种子，用于复现结果
 
+    Returns:
+        频域中的模式位置列表，和对应的幅值列表
+    """
+    torch.manual_seed(seed)
 
-def get_watermarking_pattern(pipe, watermark, device, shape=None):
-    set_random_seed(watermark.w_seed)
-    if shape is not None:
-        gt_init = torch.randn(*shape, device=device)
-    else:
-        gt_init = pipe.get_random_latents()
-    if 'seed_ring' in watermark.w_pattern:
-        gt_patch = gt_init
-        gt_patch_tmp = copy.deepcopy(gt_patch)
-        for i in range(watermark.w_radius, 0, -1):
-            tmp_mask = circle_mask(gt_init.shape[-1], r=i)
-            tmp_mask = torch.tensor(tmp_mask).to(device)
-            for j in range(gt_patch.shape[1]):
-                gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()
-    elif 'seed_zeros' in watermark.w_pattern:
-        gt_patch = gt_init * 0
-    elif 'seed_rand' in watermark.w_pattern:
-        gt_patch = gt_init
-    elif 'rand' in watermark.w_pattern:
-        gt_patch = torch.fft.fftshift(torch.fft.fft2(gt_init), dim=(-1, -2))
-        gt_patch[:] = gt_patch[0]
-    elif 'zeros' in watermark.w_pattern:
-        gt_patch = torch.fft.fftshift(torch.fft.fft2(gt_init), dim=(-1, -2)) * 0
-    elif 'const' in watermark.w_pattern:
-        gt_patch = torch.fft.fftshift(torch.fft.fft2(gt_init), dim=(-1, -2)) * 0
-        gt_patch += watermark.w_pattern_const
-    elif 'ring' in watermark.w_pattern:
-        gt_patch = torch.fft.fftshift(torch.fft.fft2(gt_init), dim=(-1, -2))
-        gt_patch_tmp = copy.deepcopy(gt_patch)
-        for i in range(watermark.w_radius, 0, -1):
-            tmp_mask = circle_mask(gt_init.shape[-1], r=i)
-            tmp_mask = torch.tensor(tmp_mask).to(device)
-            for j in range(gt_patch.shape[1]):
-                gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()
-    else:
-        raise NotImplementedError(f'w_pattern: {watermark.w_mask_shape}')
+    # 只考虑低频部分，设定阈值为信号长度的20%
+    low_freq_threshold = int(signal_length * 0.2)
 
-    return gt_patch
+    # 生成候选的低频位置（排除直流分量0）
+    positions = torch.arange(1, low_freq_threshold)
+
+    # 随机选择指定数量的位置
+    selected_positions = positions[torch.randperm(len(positions))[:num_patterns]]
+    selected_positions, _ = torch.sort(selected_positions)  # 排序以保持一定的顺序性
+
+    # 为每个选定位置生成随机幅值（在0.1到0.3之间）
+    amplitudes = 0.1 + 0.2 * torch.rand(num_patterns)
+
+    return selected_positions, amplitudes
 
 
-def get_watermarking_mask(init_latents_w, watermark, device):
-    watermarking_mask = torch.zeros(init_latents_w.shape, dtype=torch.bool).to(device)
+def add_watermark(latent_code, positions, amplitudes, strength=1.0):
+    """
+    在频域中添加水印
 
-    if watermark.w_mask_shape == 'circle':
-        np_mask = circle_mask(init_latents_w.shape[-1], r=watermark.w_radius)
-        torch_mask = torch.tensor(np_mask).to(device)
-        if watermark.w_channel == -1:
-            watermarking_mask[:, :] = torch_mask  # all channels
-        else:
-            watermarking_mask[:, watermark.w_channel] = torch_mask
-    elif watermark.w_mask_shape == 'square':
-        anchor_p = init_latents_w.shape[-1] // 2
-        if watermark.w_channel == -1:
-            # all channels
-            watermarking_mask[:, :, anchor_p - watermark.w_radius:anchor_p + watermark.w_radius,
-            anchor_p - watermark.w_radius:anchor_p + watermark.w_radius] = True
-        else:
-            watermarking_mask[:, watermark.w_channel, anchor_p - watermark.w_radius:anchor_p + watermark.w_radius,
-            anchor_p - watermark.w_radius:anchor_p + watermark.w_radius] = True
-    elif watermark.w_mask_shape == 'no':
-        pass
-    else:
-        raise NotImplementedError(f'w_mask_shape: {watermark.w_mask_shape}')
+    Args:
+        latent_code: 输入的潜码，形状为 (batch_size, 256)
+        positions: 要添加水印的频率位置
+        amplitudes: 每个位置的幅值
+        strength: 水印强度系数
 
-    return watermarking_mask
+    Returns:
+        添加了水印的潜码
+    """
+    positions = positions.to(latent_code.device)
+    amplitudes = amplitudes.to(latent_code.device)
 
+    freq_domain = fft.fft(latent_code, dim=1)
 
-def inject_watermark(init_latents_w, watermarking_mask, gt_patch, watermark):
-    init_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(init_latents_w), dim=(-1, -2))
-    if watermark.w_injection == 'complex':
-        init_latents_w_fft[watermarking_mask] = gt_patch[watermarking_mask].clone()
-    elif watermark.w_injection == 'seed':
-        init_latents_w[watermarking_mask] = gt_patch[watermarking_mask].clone()
-        return init_latents_w
-    else:
-        NotImplementedError(f'w_injection: {watermark.w_injection}')
+    for pos, amp in zip(positions, amplitudes):
+        # 在正频率和负频率对称位置都添加
+        freq_domain[:, pos] += strength * amp
+        freq_domain[:, -pos] += strength * amp.conj()  # 共轭以保持实数性质
 
-    init_latents_w = torch.fft.ifft2(torch.fft.ifftshift(init_latents_w_fft, dim=(-1, -2))).real
+    watermarked = fft.ifft(freq_domain, dim=1).real
 
-    return init_latents_w
+    return watermarked
 
 
-def eval_watermark(reversed_latents_no_w, reversed_latents_w, watermarking_mask, gt_patch, watermark):
-    if 'complex' in watermark.w_measurement:
-        reversed_latents_no_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_no_w), dim=(-1, -2))
-        reversed_latents_w_fft = torch.fft.fftshift(torch.fft.fft2(reversed_latents_w), dim=(-1, -2))
-        target_patch = gt_patch
-    elif 'seed' in watermark.w_measurement:
-        reversed_latents_no_w_fft = reversed_latents_no_w
-        reversed_latents_w_fft = reversed_latents_w
-        target_patch = gt_patch
-    else:
-        NotImplementedError(f'w_measurement: {watermark.w_measurement}')
+def detect_watermark(latent_code, positions, amplitudes, threshold=0.8):
+    """
+    检测水印
 
-    if 'l1' in watermark.w_measurement:
-        no_w_metric = torch.abs(
-            reversed_latents_no_w_fft[watermarking_mask] - target_patch[watermarking_mask]).mean().item()
-        w_metric = torch.abs(reversed_latents_w_fft[watermarking_mask] - target_patch[watermarking_mask]).mean().item()
-    else:
-        NotImplementedError(f'w_measurement: {watermark.w_measurement}')
+    Args:
+        latent_code: 待检测的潜码
+        positions: 水印的频率位置
+        amplitudes: 期望的幅值
+        threshold: 检测阈值
 
-    return no_w_metric, w_metric
+    Returns:
+        是否检测到水印，以及相似度分数
+    """
+    batch_size, signal_length = latent_code.shape
+    device = latent_code.device
+
+    # 将位置和幅值移到正确的设备
+    positions = positions.to(device)
+    amplitudes = amplitudes.to(device)
+
+    # 应用低通滤波器
+    freq_domain = fft.fft(latent_code, dim=1)
+
+    # 创建低通滤波器（保留20%的低频）
+    cutoff = int(signal_length * 0.2)
+    low_pass = torch.zeros(signal_length, device=device)
+    low_pass[:cutoff] = 1
+    low_pass[-cutoff:] = 1
+
+    # 应用滤波器
+    freq_domain = freq_domain * low_pass.unsqueeze(0)
+
+    # 检查指定位置的幅值
+    detected_amplitudes = torch.zeros_like(amplitudes)
+    for i, pos in enumerate(positions):
+        detected_amplitudes[i] = torch.abs(freq_domain[:, pos]).mean()
+
+    # 计算与期望幅值的余弦相似度
+    similarity = torch.nn.functional.cosine_similarity(
+        detected_amplitudes.unsqueeze(0),
+        amplitudes.unsqueeze(0)
+    ).item()
+
+    # 根据阈值判断是否检测到水印
+    is_watermarked = similarity > threshold
+
+    return is_watermarked, similarity

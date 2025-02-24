@@ -1,11 +1,8 @@
 import hydra
-import numpy as np
 import omegaconf
-import torch
 import pytorch_lightning as pl
 import torch.nn as nn
 from torch.nn import functional as F
-from torch_scatter import scatter
 from tqdm import tqdm
 from typing import Any, Dict
 
@@ -197,16 +194,14 @@ class CDVAE(BaseModule):
         """
         if gt_num_atoms is not None:
             num_atoms = self.predict_num_atoms(z)
-            lengths_and_angles, lengths, angles = (
-                self.predict_lattice(z, gt_num_atoms))
+            lengths_and_angles, lengths, angles = (self.predict_lattice(z, gt_num_atoms))
             composition_per_atom = self.predict_composition(z, gt_num_atoms)
             if self.hparams.teacher_forcing_lattice and teacher_forcing:
                 lengths = gt_lengths
                 angles = gt_angles
         else:
             num_atoms = self.predict_num_atoms(z).argmax(dim=-1)
-            lengths_and_angles, lengths, angles = (
-                self.predict_lattice(z, num_atoms))
+            lengths_and_angles, lengths, angles = self.predict_lattice(z, num_atoms)
             composition_per_atom = self.predict_composition(z, num_atoms)
         return num_atoms, lengths_and_angles, lengths, angles, composition_per_atom
 
@@ -229,48 +224,42 @@ class CDVAE(BaseModule):
             all_noise_cart = []
             all_atom_types = []
 
-        # obtain key stats.
-        num_atoms, _, lengths, angles, composition_per_atom = self.decode_stats(
-            z, gt_num_atoms)
+        # obtain key stats
+        num_atoms, _, lengths, angles, composition_per_atom = self.decode_stats(z, gt_num_atoms)
         if gt_num_atoms is not None:
             num_atoms = gt_num_atoms
 
-        # obtain atom types.
+        # obtain atom types
         composition_per_atom = F.softmax(composition_per_atom, dim=-1)
         if gt_atom_types is None:
-            cur_atom_types = self.sample_composition(
-                composition_per_atom, num_atoms)
+            cur_atom_types = self.sample_composition(composition_per_atom, num_atoms)
         else:
             cur_atom_types = gt_atom_types
 
-        # init coords.
+        # init coords
         cur_frac_coords = torch.rand((num_atoms.sum(), 3), device=z.device)
 
-        # annealed langevin dynamics.
+        # annealed Langevin dynamics
         for sigma in tqdm(self.sigmas, total=self.sigmas.size(0), disable=ld_kwargs.disable_bar):
             if sigma < ld_kwargs.min_sigma:
                 break
             step_size = ld_kwargs.step_lr * (sigma / self.sigmas[-1]) ** 2
 
             for step in range(ld_kwargs.n_step_each):
-                noise_cart = torch.randn_like(
-                    cur_frac_coords) * torch.sqrt(step_size * 2)
-                pred_cart_coord_diff, pred_atom_types = self.decoder(
-                    z, cur_frac_coords, cur_atom_types, num_atoms, lengths, angles)
-                cur_cart_coords = frac_to_cart_coords(
-                    cur_frac_coords, lengths, angles, num_atoms)
+                noise_cart = torch.randn_like(cur_frac_coords) * torch.sqrt(step_size * 2)
+                pred_cart_coord_diff, pred_atom_types = self.decoder(z, cur_frac_coords, cur_atom_types, num_atoms,
+                                                                     lengths, angles)
+                cur_cart_coords = frac_to_cart_coords(cur_frac_coords, lengths, angles, num_atoms)
                 pred_cart_coord_diff = pred_cart_coord_diff / sigma
                 cur_cart_coords = cur_cart_coords + step_size * pred_cart_coord_diff + noise_cart
-                cur_frac_coords = cart_to_frac_coords(
-                    cur_cart_coords, lengths, angles, num_atoms)
+                cur_frac_coords = cart_to_frac_coords(cur_cart_coords, lengths, angles, num_atoms)
 
                 if gt_atom_types is None:
                     cur_atom_types = torch.argmax(pred_atom_types, dim=1) + 1
 
                 if ld_kwargs.save_traj:
                     all_frac_coords.append(cur_frac_coords)
-                    all_pred_cart_coord_diff.append(
-                        step_size * pred_cart_coord_diff)
+                    all_pred_cart_coord_diff.append(step_size * pred_cart_coord_diff)
                     all_noise_cart.append(noise_cart)
                     all_atom_types.append(cur_atom_types)
 
@@ -293,13 +282,13 @@ class CDVAE(BaseModule):
         return samples
 
     def forward(self, batch, teacher_forcing, training):
-        # hacky way to resolve the NaN issue. Will need more careful debugging later.
+        # hacky way to resolve the NaN issue. Will need more careful debugging later
         mu, log_var, z = self.encode(batch)
 
         (pred_num_atoms, pred_lengths_and_angles, pred_lengths, pred_angles, pred_composition_per_atom) \
             = self.decode_stats(z, batch.num_atoms, batch.lengths, batch.angles, teacher_forcing)
 
-        # sample noise levels.
+        # sample noise levels
         noise_level = torch.randint(0, self.sigmas.size(0), (batch.num_atoms.size(0),), device=self.device)
         used_sigmas_per_atom = self.sigmas[noise_level].repeat_interleave(batch.num_atoms, dim=0)
 
@@ -308,9 +297,8 @@ class CDVAE(BaseModule):
 
         # add noise to atom types and sample atom types.
         pred_composition_probs = F.softmax(pred_composition_per_atom.detach(), dim=-1)
-        atom_type_probs = (
-                F.one_hot(batch.atom_types - 1, num_classes=MAX_ATOMIC_NUM) +
-                pred_composition_probs * used_type_sigmas_per_atom[:, None])
+        atom_type_probs = (F.one_hot(batch.atom_types - 1, num_classes=MAX_ATOMIC_NUM) +
+                           pred_composition_probs * used_type_sigmas_per_atom[:, None])
         rand_atom_types = torch.multinomial(atom_type_probs, num_samples=1).squeeze(1) + 1
 
         # add noise to the cart coords
@@ -414,8 +402,7 @@ class CDVAE(BaseModule):
     def predict_lattice(self, z, num_atoms):
         self.lattice_scaler.match_device(z)
         pred_lengths_and_angles = self.fc_lattice(z)  # (N, 6)
-        scaled_preds = self.lattice_scaler.inverse_transform(
-            pred_lengths_and_angles)
+        scaled_preds = self.lattice_scaler.inverse_transform(pred_lengths_and_angles)
         pred_lengths = scaled_preds[:, :3]
         pred_angles = scaled_preds[:, 3:]
         if self.hparams.data.lattice_scale_method == 'scale_length':
