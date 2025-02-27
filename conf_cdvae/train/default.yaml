@@ -1,13 +1,11 @@
 # reproducibility
-deterministic: True
+deterministic: False
 random_seed: 42
 
 # training
-
 pl_trainer:
   fast_dev_run: False # Enable this for debug purposes
   gpus: 1
-  # accelerator: ddp
   precision: 32
   # max_steps: 10000
   max_epochs: ${data.train_max_epochs}
@@ -27,4 +25,3 @@ early_stopping:
 model_checkpoints:
   save_top_k: 1
   verbose: False
-  save_last: False
